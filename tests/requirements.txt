@@ -1,0 +1,1 @@
+moto[dynamodb,dynamodbstreams,sns,sqs]==5.1.15

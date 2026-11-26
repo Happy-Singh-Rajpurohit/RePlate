@@ -1,0 +1,68 @@
+name: RePlate AWS
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Apply the AWS stack
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: hashicorp/setup-terraform@v3
+      - run: pip install -r requirements.txt -r tests/requirements.txt
+      - run: python -m unittest discover -s tests -v
+      - run: node --check app/web/portal.js
+      - run: terraform fmt -check -recursive infra
+      - run: |
+          terraform -chdir=infra/bootstrap init -backend=false
+          terraform -chdir=infra/bootstrap validate
+          terraform -chdir=infra init -backend=false
+          terraform -chdir=infra validate
+  deploy:
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy
+    needs: checks
+    runs-on: ubuntu-latest
+    environment: aws
+    concurrency: replate-aws
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      STATE_BUCKET: ${{ vars.STATE_BUCKET }}
+      TF_VAR_name: ${{ vars.STACK_NAME || 'replate' }}
+      TF_VAR_region: ${{ vars.AWS_REGION }}
+      TF_VAR_enable_cache: ${{ vars.ENABLE_CACHE || 'false' }}
+      TF_VAR_enable_sms: ${{ vars.ENABLE_SMS || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and publish
+        run: |
+          image="$ECR_REPOSITORY:$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker build --platform linux/amd64 -t "$image" .
+          docker push "$image"
+          printf 'TF_VAR_image=%s\n' "$image" >> "$GITHUB_ENV"
+      - run: terraform -chdir=infra init -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$AWS_REGION"
+      - run: terraform -chdir=infra apply -input=false -auto-approve
+      - name: Verify portal health
+        run: curl -fSs --retry 6 --retry-all-errors "$(terraform -chdir=infra output -raw url)/health"
